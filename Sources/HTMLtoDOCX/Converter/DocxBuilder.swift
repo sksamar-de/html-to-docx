@@ -16,11 +16,18 @@ enum DocxBuilder {
         let blocks = collectBlocks(parsed.root)
         let body = documentXML(blocks: blocks, resolver: resolver)
 
+        // The order of parts inside the ZIP doesn't matter to Word, but the
+        // relationship graph does: every part declared in
+        // `[Content_Types].xml` must be reachable from the package root via
+        // a `.rels` chain. We provide the package-root `_rels/.rels` linking
+        // to `document.xml`, plus `word/_rels/document.xml.rels` linking
+        // `document.xml` to `styles.xml`.
         let entries: [(String, Data)] = [
-            ("[Content_Types].xml", Data(contentTypesXML.utf8)),
-            ("_rels/.rels",          Data(rootRelsXML.utf8)),
-            ("word/styles.xml",      Data(stylesXML.utf8)),
-            ("word/document.xml",    Data(body.utf8))
+            ("[Content_Types].xml",        Data(contentTypesXML.utf8)),
+            ("_rels/.rels",                Data(rootRelsXML.utf8)),
+            ("word/_rels/document.xml.rels", Data(documentRelsXML.utf8)),
+            ("word/styles.xml",            Data(stylesXML.utf8)),
+            ("word/document.xml",          Data(body.utf8))
         ]
         return (entries, blocks.count)
     }
@@ -65,14 +72,24 @@ enum DocxBuilder {
 </Relationships>
 """
 
+    /// Document-scoped relationships. Required by the OPC spec so Word
+    /// doesn't treat `styles.xml` as an orphan part.
+    private static let documentRelsXML = """
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>
+</Relationships>
+"""
+
     /// We push *all* styling into direct formatting on each <w:p>/<w:r>, so
     /// styles.xml only needs to define the implicit Normal style. This is the
     /// minimum Word will accept.
+    /// Children of `<w:rPr>` here are in schema order (color before sz).
     private static let stylesXML = """
 <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
   <w:docDefaults>
-    <w:rPrDefault><w:rPr><w:sz w:val="22"/><w:color w:val="000000"/></w:rPr></w:rPrDefault>
+    <w:rPrDefault><w:rPr><w:color w:val="000000"/><w:sz w:val="22"/><w:szCs w:val="22"/></w:rPr></w:rPrDefault>
     <w:pPrDefault><w:pPr><w:spacing w:after="0" w:line="276" w:lineRule="auto"/></w:pPr></w:pPrDefault>
   </w:docDefaults>
   <w:style w:type="paragraph" w:default="1" w:styleId="Normal">
@@ -234,10 +251,13 @@ enum DocxBuilder {
 
     // MARK: - OOXML run + paragraph property emission
 
+    /// Children of `<w:pPr>` must appear in CT_PPrBase schema order.
+    /// We emit, in order: shd → spacing → ind → jc.
     private static func paragraphPropertiesXML(_ style: ComputedStyle) -> String {
         var pPr = ""
-        if let align = style.textAlign {
-            pPr += "<w:jc w:val=\"\(align.rawValue)\"/>"
+
+        if let bg = style.background {
+            pPr += "<w:shd w:val=\"clear\" w:color=\"auto\" w:fill=\"\(bg.hex)\"/>"
         }
 
         let before = style.marginTopPt.map { Int(($0 * 20).rounded()) }
@@ -257,9 +277,11 @@ enum DocxBuilder {
             let twentieths = Int((indent * 20).rounded())
             pPr += "<w:ind w:firstLine=\"\(twentieths)\"/>"
         }
-        if let bg = style.background {
-            pPr += "<w:shd w:val=\"clear\" w:color=\"auto\" w:fill=\"\(bg.hex)\"/>"
+
+        if let align = style.textAlign {
+            pPr += "<w:jc w:val=\"\(align.rawValue)\"/>"
         }
+
         return pPr.isEmpty ? "" : "<w:pPr>\(pPr)</w:pPr>"
     }
 
@@ -277,27 +299,37 @@ enum DocxBuilder {
         return out
     }
 
+    /// Children of `<w:rPr>` must appear in CT_RPr schema order.
+    /// We emit, in order: rFonts → b → bCs → i → iCs → strike → color →
+    /// sz → szCs → u → shd. Wrong order is the #1 reason Word shows the
+    /// "we found a problem with the content" repair dialog.
     private static func runPropertiesXML(_ style: ComputedStyle,
                                          paragraphStyle: ComputedStyle) -> String {
         var rPr = ""
+
         if let family = style.fontFamily, !family.isEmpty {
             let f = escapeXMLAttribute(family)
             rPr += "<w:rFonts w:ascii=\"\(f)\" w:hAnsi=\"\(f)\" w:cs=\"\(f)\"/>"
         }
-        if style.bold { rPr += "<w:b/><w:bCs/>" }
-        if style.italic { rPr += "<w:i/><w:iCs/>" }
-        if style.underline { rPr += "<w:u w:val=\"single\"/>" }
-        if style.strikethrough { rPr += "<w:strike/>" }
-        if style.color != .black {
-            rPr += "<w:color w:val=\"\(style.color.hex)\"/>"
-        } else {
-            rPr += "<w:color w:val=\"000000\"/>"
+        if style.bold {
+            rPr += "<w:b/><w:bCs/>"
         }
+        if style.italic {
+            rPr += "<w:i/><w:iCs/>"
+        }
+        if style.strikethrough {
+            rPr += "<w:strike/>"
+        }
+        rPr += "<w:color w:val=\"\(style.color.hex)\"/>"
         let halfPoints = max(2, Int((style.fontSizePt * 2).rounded()))
         rPr += "<w:sz w:val=\"\(halfPoints)\"/><w:szCs w:val=\"\(halfPoints)\"/>"
+        if style.underline {
+            rPr += "<w:u w:val=\"single\"/>"
+        }
         if let bg = style.background, paragraphStyle.background != bg {
             rPr += "<w:shd w:val=\"clear\" w:color=\"auto\" w:fill=\"\(bg.hex)\"/>"
         }
+
         return rPr.isEmpty ? "" : "<w:rPr>\(rPr)</w:rPr>"
     }
 
